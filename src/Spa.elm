@@ -31,44 +31,9 @@ import Browser.Navigation as Nav
 import Effect exposing (Effect)
 import Html
 import Internal exposing (PageDefinition)
+import Spa.PageStack as PageStack
 import Url exposing (Url)
 import Url.Parser exposing ((</>), Parser)
-
-
-type PageMsg current previous
-    = CurrentMsg current
-    | PreviousMsg previous
-
-
-type PageModel current previous
-    = NoPage
-    | Current current
-    | Previous previous
-
-
-previousPageModel :
-    PageModel current (PageModel previous previous2)
-    -> PageModel previous previous2
-previousPageModel page =
-    case page of
-        Previous previous ->
-            previous
-
-        Current _ ->
-            NoPage
-
-        NoPage ->
-            NoPage
-
-
-currentPageModel : PageModel current previous -> Maybe current
-currentPageModel page =
-    case page of
-        Current model ->
-            Just model
-
-        _ ->
-            Nothing
 
 
 type Msg sharedMsg pageMsg
@@ -76,22 +41,6 @@ type Msg sharedMsg pageMsg
     | PageMsg pageMsg
     | UrlRequest UrlRequest
     | UrlChange Url
-
-
-mapPreviousMsg : Msg sharedMsg previous -> Msg sharedMsg (PageMsg current previous)
-mapPreviousMsg msg =
-    case msg of
-        SharedMsg sharedMsg ->
-            SharedMsg sharedMsg
-
-        PageMsg previousMsg ->
-            PageMsg <| PreviousMsg previousMsg
-
-        UrlRequest request ->
-            UrlRequest request
-
-        UrlChange url ->
-            UrlChange url
 
 
 type alias Page flags sharedMsg view model msg =
@@ -103,49 +52,32 @@ type PageSetup flags identity shared sharedMsg view model msg
     | ProtectedPage (shared -> identity -> Page flags sharedMsg view model msg)
 
 
-type alias CoreModel route shared =
+type alias Model route shared current previous =
     { key : Nav.Key
     , currentRoute : route
     , shared : shared
+    , page : PageStack.Model current previous
     }
 
 
-type alias Model route shared current previous =
-    ( CoreModel route shared, PageModel current previous )
-
-
-type alias NoPageModel route shared =
-    Model route shared () ()
-
-
-modelPrevious : Model route shared current (PageModel previous previous2) -> Model route shared previous previous2
-modelPrevious ( core, page ) =
-    ( core, previousPageModel page )
-
-
 modelShared : Model route shared current previous -> shared
-modelShared ( core, _ ) =
-    core.shared
+modelShared { shared } =
+    shared
 
 
-initModel : route -> Nav.Key -> shared -> NoPageModel route shared
+initModel : route -> Nav.Key -> shared -> Model route shared current previous
 initModel route key shared =
-    ( { key = key
-      , currentRoute = route
-      , shared = shared
-      }
-    , NoPage
-    )
+    { key = key
+    , currentRoute = route
+    , shared = shared
+    , page = PageStack.empty
+    }
 
 
-type alias Builder flags route identity shared sharedMsg view current previous pageMsg =
-    { init : flags -> Url -> Nav.Key -> ( Model route shared current previous, Cmd (Msg sharedMsg pageMsg) )
-    , view : Model route shared current previous -> view
-    , update : Msg sharedMsg pageMsg -> Model route shared current previous -> ( Model route shared current previous, Cmd (Msg sharedMsg pageMsg) )
-    , subscriptions : Model route shared current previous -> Sub (Msg sharedMsg pageMsg)
-    , toRoute : Url -> route
+type alias Builder route identity shared sharedMsg view current previous stackMsg =
+    { toRoute : Url -> route
     , extractIdentity : shared -> Maybe identity
-    , protectPage : route -> String
+    , pageStack : PageStack.Stack shared sharedMsg route view current previous stackMsg
     }
 
 
@@ -163,39 +95,30 @@ type alias Builder flags route identity shared sharedMsg view current previous p
 
 -}
 init :
-    { init : flags -> Nav.Key -> ( shared, Cmd sharedMsg )
-    , subscriptions : shared -> Sub sharedMsg
-    , update : sharedMsg -> shared -> ( shared, Cmd sharedMsg )
-    , defaultView : view
+    { defaultView : view
     , toRoute : Url -> route
     , extractIdentity : shared -> Maybe identity
-    , protectPage : route -> String
     }
-    -> Builder flags route identity shared sharedMsg view () () ()
+    -> Builder route identity shared sharedMsg view () () ()
 init shared =
-    { init = builderInit shared.toRoute shared.init
-    , subscriptions = \( core, _ ) -> shared.subscriptions core.shared |> Sub.map SharedMsg
-    , update = builderRootUpdate shared.toRoute shared.update
-    , view =
-        always shared.defaultView
-    , toRoute = shared.toRoute
+    { toRoute = shared.toRoute
     , extractIdentity = shared.extractIdentity
-    , protectPage = shared.protectPage
+    , pageStack = PageStack.setup { defaultView = shared.defaultView }
     }
 
 
 {-| Bootstrap a Spa application that has no Shared state
 -}
-initNoShared : (Url -> route) -> view -> Builder () route () () () view () () ()
-initNoShared toRoute defaultView =
+initNoShared :
+    { defaultView : view
+    , toRoute : Url -> route
+    }
+    -> Builder route () () () view () () ()
+initNoShared { toRoute, defaultView } =
     init
-        { init = \_ _ -> ( (), Cmd.none )
-        , subscriptions = always Sub.none
-        , update = \_ _ -> ( (), Cmd.none )
-        , defaultView = defaultView
+        { defaultView = defaultView
         , toRoute = toRoute
         , extractIdentity = always Nothing
-        , protectPage = always "/"
         }
 
 
@@ -214,55 +137,31 @@ builderInit toRoute sharedInit flags url key =
     ( initModel (toRoute url) key shared, Cmd.map SharedMsg sharedCmd )
 
 
-builderRootUpdate :
-    (Url -> route)
-    -> (sharedMsg -> shared -> ( shared, Cmd sharedMsg ))
-    -> Msg sharedMsg ()
-    -> Model route shared () ()
-    -> ( Model route shared () (), Cmd (Msg sharedMsg ()) )
-builderRootUpdate toRoute sharedUpdate msg ( core, page ) =
-    case msg of
-        SharedMsg sharedMsg ->
-            let
-                ( sharedNew, sharedCmd ) =
-                    sharedUpdate sharedMsg core.shared
-            in
-            ( ( { core | shared = sharedNew }, page ), Cmd.map SharedMsg sharedCmd )
-
-        UrlChange url ->
-            ( ( { core | currentRoute = toRoute url }, NoPage ), Cmd.none )
-
-        _ ->
-            -- XXX: This is an unexpected situation. We may want to report this
-            -- somehow
-            ( ( core, page ), Cmd.none )
-
-
 setupPage :
     (shared -> Maybe identity)
     -> shared
     -> PageSetup pageFlags identity shared sharedMsg pageView currentPageModel currentPageMsg
-    -> Maybe (PageDefinition pageFlags sharedMsg pageView currentPageModel currentPageMsg)
+    -> Maybe (Page pageFlags sharedMsg pageView currentPageModel currentPageMsg)
 setupPage extractIdentity shared page =
     case page of
         PublicPage setup ->
-            Just <| Internal.pageDefinition <| setup shared
+            Just <| setup shared
 
         ProtectedPage setup ->
             extractIdentity shared
-                |> Maybe.map (setup shared >> Internal.pageDefinition)
+                |> Maybe.map (setup shared)
 
 
 {-| Add a public page to the application
 -}
 addPublicPage :
-    ( (currentPageMsg -> Msg sharedMsg (PageMsg currentPageMsg previousPageMsg)) -> pageView -> view
-    , (Msg sharedMsg previousPageMsg -> Msg sharedMsg (PageMsg currentPageMsg previousPageMsg)) -> previousView -> view
+    ( PageStack.CurrentViewMap currentPageMsg previousStackMsg pageView view
+    , PageStack.PreviousViewMap currentPageMsg previousStackMsg previousView view
     )
     -> (route -> Maybe pageFlags)
     -> (shared -> Page pageFlags sharedMsg pageView currentPageModel currentPageMsg)
-    -> Builder flags route identity shared sharedMsg previousView prev prevprev previousPageMsg
-    -> Builder flags route identity shared sharedMsg view currentPageModel (PageModel prev prevprev) (PageMsg currentPageMsg previousPageMsg)
+    -> Builder route identity shared sharedMsg previousView previousCurrent previousPrevious previousStackMsg
+    -> Builder route identity shared sharedMsg view currentPageModel (PageStack.Model previousCurrent previousPrevious) (PageStack.Msg currentPageMsg previousStackMsg)
 addPublicPage mappers matchRoute page =
     addPage mappers matchRoute (PublicPage page)
 
@@ -270,185 +169,40 @@ addPublicPage mappers matchRoute page =
 {-| Add a protected page to the application
 -}
 addProtectedPage :
-    ( (currentPageMsg -> Msg sharedMsg (PageMsg currentPageMsg previousPageMsg)) -> pageView -> view
-    , (Msg sharedMsg previousPageMsg -> Msg sharedMsg (PageMsg currentPageMsg previousPageMsg)) -> previousView -> view
+    ( PageStack.CurrentViewMap currentPageMsg previousStackMsg pageView view
+    , PageStack.PreviousViewMap currentPageMsg previousStackMsg previousView view
     )
     -> (route -> Maybe pageFlags)
     -> (shared -> identity -> Page pageFlags sharedMsg pageView currentPageModel currentPageMsg)
-    -> Builder flags route identity shared sharedMsg previousView prev prevprev previousPageMsg
-    -> Builder flags route identity shared sharedMsg view currentPageModel (PageModel prev prevprev) (PageMsg currentPageMsg previousPageMsg)
+    -> Builder route identity shared sharedMsg previousView previousCurrent previousPrevious previousStackMsg
+    -> Builder route identity shared sharedMsg view currentPageModel (PageStack.Model previousCurrent previousPrevious) (PageStack.Msg currentPageMsg previousStackMsg)
 addProtectedPage mappers matchRoute page =
     addPage mappers matchRoute (ProtectedPage page)
 
 
 addPage :
-    ( (currentPageMsg -> Msg sharedMsg (PageMsg currentPageMsg previousPageMsg)) -> pageView -> view
-    , (Msg sharedMsg previousPageMsg -> Msg sharedMsg (PageMsg currentPageMsg previousPageMsg)) -> previousView -> view
+    ( PageStack.CurrentViewMap currentPageMsg previousStackMsg pageView view
+    , PageStack.PreviousViewMap currentPageMsg previousStackMsg previousView view
     )
     -> (route -> Maybe pageFlags)
     -> PageSetup pageFlags identity shared sharedMsg pageView currentPageModel currentPageMsg
-    -> Builder flags route identity shared sharedMsg previousView prev prevprev previousPageMsg
-    -> Builder flags route identity shared sharedMsg view currentPageModel (PageModel prev prevprev) (PageMsg currentPageMsg previousPageMsg)
-addPage ( viewMap1, viewMap2 ) matchRoute page builder =
+    -> Builder route identity shared sharedMsg previousView prev prevprev previousStackMsg
+    -> Builder route identity shared sharedMsg view currentPageModel (PageStack.Model prev prevprev) (PageStack.Msg currentPageMsg previousStackMsg)
+addPage mappers matchRoute page builder =
     let
-        setupCurrentPage ( ( core, currentPage ), previousCmd ) =
-            let
-                ( pageModel, cmd ) =
-                    case currentPage of
-                        NoPage ->
-                            case core.currentRoute |> matchRoute of
-                                Just pageFlags ->
-                                    case setupPage builder.extractIdentity core.shared page of
-                                        Just setup ->
-                                            let
-                                                ( newCurrentPage, newCurrentPageEffect ) =
-                                                    setup.init pageFlags
-                                            in
-                                            ( Current newCurrentPage
-                                            , newCurrentPageEffect
-                                                |> Effect.toCmd ( SharedMsg, CurrentMsg >> PageMsg )
-                                            )
-
-                                        Nothing ->
-                                            ( NoPage, Nav.replaceUrl core.key (builder.protectPage core.currentRoute) )
-
-                                Nothing ->
-                                    ( NoPage, Cmd.none )
-
-                        prevPage ->
-                            ( Previous prevPage, Cmd.none )
-            in
-            ( ( core, pageModel )
-            , Cmd.batch
-                [ previousCmd
-                    |> Cmd.map mapPreviousMsg
-                , cmd
-                ]
-            )
+        pageStack =
+            builder.pageStack
+                |> PageStack.add mappers
+                    matchRoute
+                    (\shared ->
+                        setupPage builder.extractIdentity
+                            shared
+                            page
+                    )
     in
     { toRoute = builder.toRoute
     , extractIdentity = builder.extractIdentity
-    , protectPage = builder.protectPage
-    , init =
-        \flags url key ->
-            builder.init flags url key
-                |> setupCurrentPage
-    , subscriptions =
-        \( core, currentPage ) ->
-            Sub.batch
-                [ case currentPage of
-                    Current current ->
-                        case setupPage builder.extractIdentity core.shared page of
-                            Just setup ->
-                                setup.subscriptions current
-                                    |> Sub.map (CurrentMsg >> PageMsg)
-
-                            Nothing ->
-                                Sub.none
-
-                    _ ->
-                        Sub.none
-                , builder.subscriptions (modelPrevious ( core, currentPage ))
-                    |> Sub.map mapPreviousMsg
-                ]
-    , update =
-        \msg ( core, currentPage ) ->
-            case msg of
-                PageMsg (CurrentMsg pageMsg) ->
-                    case currentPageModel currentPage of
-                        Just pageModel ->
-                            case setupPage builder.extractIdentity core.shared page of
-                                Just setup ->
-                                    let
-                                        ( pageModelNew, pageEffect ) =
-                                            setup.update pageMsg pageModel
-                                    in
-                                    ( ( core, Current pageModelNew )
-                                    , Effect.toCmd ( SharedMsg, CurrentMsg >> PageMsg ) pageEffect
-                                    )
-
-                                Nothing ->
-                                    ( ( core, NoPage )
-                                    , Nav.replaceUrl core.key
-                                        (builder.protectPage core.currentRoute)
-                                    )
-
-                        Nothing ->
-                            ( ( core, currentPage ), Cmd.none )
-
-                PageMsg (PreviousMsg pageMsg) ->
-                    let
-                        ( ( previousCore, previousPage ), previousCmd ) =
-                            builder.update (PageMsg pageMsg) (modelPrevious ( core, currentPage ))
-                    in
-                    ( ( core, Previous previousPage )
-                    , previousCmd |> Cmd.map mapPreviousMsg
-                    )
-
-                SharedMsg sharedMsg ->
-                    let
-                        ( ( previousCore, previousPage ), previousCmd ) =
-                            builder.update (SharedMsg sharedMsg) (modelPrevious ( core, currentPage ))
-
-                        ( newPage, newPageEffect ) =
-                            case ( previousPage, currentPage ) of
-                                ( NoPage, Current _ ) ->
-                                    case setupPage builder.extractIdentity previousCore.shared page of
-                                        Just setup ->
-                                            -- the page is still accessible
-                                            ( currentPage, Cmd.none )
-
-                                        Nothing ->
-                                            ( NoPage, Nav.replaceUrl core.key (builder.protectPage core.currentRoute) )
-
-                                ( NoPage, _ ) ->
-                                    ( NoPage, Cmd.none )
-
-                                ( previous, _ ) ->
-                                    ( Previous previous, Cmd.none )
-                    in
-                    ( ( { previousCore
-                            | currentRoute = core.currentRoute
-                        }
-                      , newPage
-                      )
-                    , Cmd.batch
-                        [ previousCmd |> Cmd.map mapPreviousMsg
-                        , newPageEffect |> Cmd.map (CurrentMsg >> PageMsg)
-                        ]
-                    )
-
-                UrlRequest urlRequest ->
-                    case urlRequest of
-                        Browser.Internal url ->
-                            ( ( core, currentPage )
-                            , Nav.pushUrl core.key (Url.toString url)
-                            )
-
-                        Browser.External url ->
-                            ( ( core, currentPage )
-                            , Nav.load url
-                            )
-
-                UrlChange url ->
-                    builder.update (UrlChange url) (modelPrevious ( core, currentPage ))
-                        |> setupCurrentPage
-    , view =
-        \( core, currentPage ) ->
-            case currentPage of
-                Current pageModel ->
-                    case setupPage builder.extractIdentity core.shared page of
-                        Just setup ->
-                            setup.view pageModel
-                                |> viewMap1 (CurrentMsg >> PageMsg)
-
-                        Nothing ->
-                            builder.view (modelPrevious ( core, currentPage ))
-                                |> viewMap2 mapPreviousMsg
-
-                _ ->
-                    builder.view (modelPrevious ( core, currentPage ))
-                        |> viewMap2 mapPreviousMsg
+    , pageStack = pageStack
     }
 
 
@@ -462,8 +216,15 @@ addPage ( viewMap1, viewMap2 ) matchRoute page builder =
 
 -}
 application :
-    { toDocument : shared -> view -> Document (Msg sharedMsg pageMsg) }
-    -> Builder flags route identity shared sharedMsg view current previous pageMsg
+    ((pageMsg -> Msg sharedMsg pageMsg) -> pageView -> view)
+    ->
+        { init : flags -> Nav.Key -> ( shared, Cmd sharedMsg )
+        , subscriptions : shared -> Sub sharedMsg
+        , update : sharedMsg -> shared -> ( shared, Cmd sharedMsg )
+        , protectPage : route -> String
+        , toDocument : shared -> view -> Document (Msg sharedMsg pageMsg)
+        }
+    -> Builder route identity shared sharedMsg pageView current previous pageMsg
     ->
         { init : flags -> Url -> Nav.Key -> ( Model route shared current previous, Cmd (Msg sharedMsg pageMsg) )
         , view : Model route shared current previous -> Document (Msg sharedMsg pageMsg)
@@ -472,11 +233,104 @@ application :
         , onUrlRequest : UrlRequest -> Msg sharedMsg pageMsg
         , onUrlChange : Url -> Msg sharedMsg pageMsg
         }
-application { toDocument } builder =
-    { init = builder.init
-    , view = \model -> builder.view model |> toDocument (modelShared model)
-    , update = builder.update
-    , subscriptions = builder.subscriptions
+application viewMap app builder =
+    let
+        initPage route key shared =
+            let
+                ( page, effect ) =
+                    builder.pageStack.init shared route
+            in
+            if
+                page
+                    |> Debug.log "page"
+                    |> PageStack.hasNoCurrentPage
+                    |> Debug.log "hasNoCurrentPage"
+            then
+                ( PageStack.empty, Nav.replaceUrl key <| app.protectPage route )
+
+            else
+                ( page, Effect.toCmd ( SharedMsg, PageMsg ) effect )
+    in
+    { init =
+        \flags url key ->
+            let
+                route =
+                    builder.toRoute url
+
+                ( shared, sharedCmd ) =
+                    app.init flags key
+
+                ( page, pageCmd ) =
+                    initPage route key shared
+            in
+            ( { key = key
+              , currentRoute = route
+              , shared = shared
+              , page = page
+              }
+            , Cmd.batch
+                [ Cmd.map SharedMsg sharedCmd
+                , pageCmd
+                ]
+            )
+    , view =
+        \model ->
+            builder.pageStack.view model.shared model.page
+                |> viewMap PageMsg
+                |> app.toDocument (modelShared model)
+    , update =
+        \msg model ->
+            case msg of
+                SharedMsg sharedMsg ->
+                    let
+                        ( newShared, sharedCmd ) =
+                            app.update sharedMsg model.shared
+                    in
+                    ( { model | shared = newShared }
+                    , Cmd.map SharedMsg sharedCmd
+                    )
+
+                PageMsg pageMsg ->
+                    let
+                        ( newPage, pageEffect ) =
+                            builder.pageStack.update model.shared pageMsg model.page
+                    in
+                    ( { model | page = newPage }
+                    , Effect.toCmd ( SharedMsg, PageMsg ) pageEffect
+                    )
+
+                UrlRequest urlRequest ->
+                    case urlRequest of
+                        Browser.Internal url ->
+                            ( model
+                            , Nav.pushUrl model.key (Url.toString url)
+                            )
+
+                        Browser.External url ->
+                            ( model
+                            , Nav.load url
+                            )
+
+                UrlChange url ->
+                    let
+                        route =
+                            builder.toRoute url
+
+                        ( page, pageCmd ) =
+                            initPage route model.key model.shared
+                    in
+                    ( { model
+                        | currentRoute = route
+                        , page = page
+                      }
+                    , pageCmd
+                    )
+    , subscriptions =
+        \model ->
+            Sub.batch
+                [ app.subscriptions model.shared |> Sub.map SharedMsg
+                , builder.pageStack.subscriptions model.shared model.page |> Sub.map PageMsg
+                ]
     , onUrlRequest = UrlRequest
     , onUrlChange = UrlChange
     }

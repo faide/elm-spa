@@ -32,17 +32,19 @@ toDocument _ view =
 
 main =
     Spa.init
-        { init = Shared.init
-        , subscriptions = Shared.subscriptions
-        , update = Shared.update
-        , defaultView = View.defaultView
+        { defaultView = View.defaultView
         , toRoute = Route.toRoute
         , extractIdentity = Shared.identity
-        , protectPage = Route.toUrl >> Just >> Route.SignIn >> Route.toUrl
         }
         |> Spa.addPublicPage mappers Route.matchHome Home.page
-        |> Spa.addPublicPage mappers Route.matchSignIn SignIn.page
         |> Spa.addProtectedPage mappers Route.matchCounter Counter.page
+        |> Spa.addPublicPage mappers Route.matchSignIn SignIn.page
         |> Spa.addPublicPage mappers Route.matchTime Time.page
-        |> Spa.application { toDocument = toDocument }
+        |> Spa.application View.map
+            { init = Shared.init
+            , subscriptions = Shared.subscriptions
+            , update = Shared.update
+            , toDocument = toDocument
+            , protectPage = Route.toUrl >> Just >> Route.SignIn >> Route.toUrl
+            }
         |> Browser.application
